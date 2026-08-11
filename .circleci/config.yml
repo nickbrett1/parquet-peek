@@ -1,0 +1,69 @@
+version: 2.1
+orbs:
+  node: circleci/node@5.0.2
+
+jobs:
+  build:
+    executor: node/default
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "package.json" }}
+            - v1-deps-
+      - run:
+          name: Install Packages
+          command: |
+            if [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+      - save_cache:
+          paths:
+            - node_modules
+          key: v1-deps-{{ checksum "package.json" }}
+
+      - run:
+          name: Build
+          command: npm run build
+      - run:
+          name: Test with Coverage
+          command: npx vitest --coverage
+      - run:
+          name: Lint (ESLint + SonarJS)
+          command: npm run lint
+
+
+
+  docker-publish:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Login to Container Registry
+          command: |
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+      - run:
+          name: Build and Push Docker Image
+          command: |
+            docker build -t ghcr.io/OWNER/parquet-peek:$CIRCLE_SHA1 -t ghcr.io/OWNER/parquet-peek:latest .
+            docker push ghcr.io/OWNER/parquet-peek:$CIRCLE_SHA1
+            docker push ghcr.io/OWNER/parquet-peek:latest
+workflows:
+  build-and-test:
+    jobs:
+      - build:
+          context: common
+
+
+      - docker-publish:
+          context: common
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
+
