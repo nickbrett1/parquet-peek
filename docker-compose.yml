@@ -4,25 +4,25 @@
 # Deploy with: docker compose up -d
 # (On Synology, import this file as a Container Manager "Project".)
 #
-# Note: replace OWNER in the image reference with your registry namespace
-# (e.g. GitHub username/org for GHCR). For public packages no registry
-# credentials are required on the host.
+# The image reference uses your registry namespace (GitHub username/org for
+# GHCR). For public packages no registry credentials are required on the host.
 
 services:
   app:
-    image: ghcr.io/OWNER/parquet-peek:latest
+    image: ghcr.io/nickbrett1/parquet-peek:latest
     container_name: parquet-peek
     restart: unless-stopped
 
     ports:
       - "3000:3000"
+
     environment:
       # Set your environment variables here or in a NAS-side .env file
-      # (genproj never commits secrets).
+      # (genproj never commits secrets). See .env.example.
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
       - "homepage.group=Services"
       - "homepage.name=parquet-peek"
-      - "homepage.href=http://YOUR_NAS_HOST:3000/"
+      - "homepage.href=http://localhost:3000/"
       - "homepage.widget.type=customapi"
       - "homepage.widget.url=http://localhost:3000/health"

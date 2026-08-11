@@ -47,11 +47,11 @@ jobs:
           command: |
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
       - run:
-          name: Build and Push Docker Image
+          name: Build and Push Multi-Arch Image
           command: |
-            docker build -t ghcr.io/OWNER/parquet-peek:$CIRCLE_SHA1 -t ghcr.io/OWNER/parquet-peek:latest .
-            docker push ghcr.io/OWNER/parquet-peek:$CIRCLE_SHA1
-            docker push ghcr.io/OWNER/parquet-peek:latest
+            docker buildx create --use || true
+            docker buildx build --platform linux/amd64,linux/arm64 --provenance=false \
+              -t ghcr.io/nickbrett1/parquet-peek:$CIRCLE_SHA1 -t ghcr.io/nickbrett1/parquet-peek:latest --push .
 workflows:
   build-and-test:
     jobs:
