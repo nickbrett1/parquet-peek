@@ -71,7 +71,7 @@ echo "INFO: Configuring git safe directory..."
 git config --global --add safe.directory /workspaces/parquet-peek
 
 echo "INFO: Installing git pre-commit hooks (lint-staged)..."
-(cd /workspaces/parquet-peek && npx simple-git-hooks) || echo "WARN: Run 'npx simple-git-hooks' to install hooks manually."
+(cd /workspaces/parquet-peek && npx --yes simple-git-hooks) || echo "WARN: Run 'npx simple-git-hooks' to install hooks manually."
 
 
 
