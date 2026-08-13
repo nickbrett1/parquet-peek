@@ -33,8 +33,6 @@ jobs:
           name: Test with Coverage
           command: npx vitest --coverage
 
-
-
   docker-publish:
     docker:
       - image: cimg/base:stable
@@ -57,7 +55,6 @@ workflows:
       - build:
           context: common
 
-
       - docker-publish:
           context: common
           requires:
@@ -65,4 +62,3 @@ workflows:
           filters:
             branches:
               only: main
-

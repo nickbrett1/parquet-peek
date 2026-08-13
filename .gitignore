@@ -14,6 +14,10 @@ build
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
+# Tests & Reports
+coverage
+reports
+
 # OS
 .DS_Store
 Thumbs.db
@@ -22,8 +26,3 @@ Thumbs.db
 .antigravitycli
 
 # Optional
-
-
-
-
-

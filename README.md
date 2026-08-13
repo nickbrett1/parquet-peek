@@ -1,6 +1,7 @@
 # parquet-peek
 
 A parquet-peek project generated with genproj
+
 ## Capabilities
 
 This project includes the following capabilities:
