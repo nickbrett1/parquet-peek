@@ -134,11 +134,13 @@ describe("createParquetStore", () => {
       `COPY (SELECT 1 AS col_empty WHERE false) TO '${path.join(tmpDir, "empty.parquet").replace(/'/g, "''")}' (FORMAT PARQUET)`,
     );
 
-    storeA = createParquetStore(tmpDir, db, { sampleTargetRows: 2000 });
-    storeB = createParquetStore(tmpDir, db, { sampleTargetRows: 500 });
+    storeA = createParquetStore(tmpDir, { sampleTargetRows: 2000 });
+    storeB = createParquetStore(tmpDir, { sampleTargetRows: 500 });
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    await storeA?.close();
+    await storeB?.close();
     if (tmpDir && fs.existsSync(tmpDir)) {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -232,12 +234,9 @@ describe("createParquetStore", () => {
   });
 
   it("caps duckdb memory so a runaway query spills instead of OOM-killing", async () => {
-    const row = await run(
-      db,
-      "SELECT current_setting('memory_limit') AS ml, current_setting('temp_directory') AS td",
-    );
-    expect(row[0].td).toBe("/tmp");
-    const mb = Number.parseFloat(row[0].ml);
+    const s = await storeA.getSettings();
+    expect(s.tempDirectory).toBe("/tmp");
+    const mb = Number.parseFloat(s.memoryLimit);
     expect(Number.isFinite(mb)).toBe(true);
     expect(mb).toBeLessThan(2048); // set to 1GB, not the default 80% of host RAM
   });
@@ -247,7 +246,7 @@ describe("createParquetStore", () => {
       ParquetPeekError,
     );
 
-    const badStore = createParquetStore("/path/does/not/exist/12345", db);
+    const badStore = createParquetStore("/path/does/not/exist/12345");
     await expect(badStore.listFiles()).rejects.toThrow(ParquetPeekError);
   });
 });

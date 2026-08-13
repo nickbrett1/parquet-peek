@@ -12,9 +12,59 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 
 const require = createRequire(import.meta.url);
-const duckdb = require("duckdb");
+// Path to the duckdb package so the worker thread can require() it without
+// relying on cwd. The worker owns the only duckdb Database instance.
+const DUCKDB_PATH = require.resolve("duckdb");
+
+/** Hard cap for any single duckdb query — a stuck query is killed, never hung. */
+const QUERY_TIMEOUT_MS = 300_000;
+
+/**
+ * Worker-thread DuckDB runner. DuckDB's node binding executes queries
+ * synchronously on the calling thread, so a big-file scan (30–90 s on the
+ * NAS) would block the whole HTTP server. Running it in a worker keeps the
+ * main event loop free; a timeout terminates the worker so nothing can ever
+ * block or accumulate memory forever.
+ */
+const WORKER_SOURCE = `
+const { parentPort, workerData } = require("node:worker_threads");
+const duckdb = require(workerData.duckdbPath);
+const db = new duckdb.Database(":memory:");
+// DuckDB cannot see the container cgroup (defaults to 80% of host RAM and
+// never spills), so cap its memory and give it a spill directory — it
+// degrades to disk instead of OOM-killing the container (see OOM memos).
+db.exec("PRAGMA memory_limit='1GB'", () => {
+  db.exec("PRAGMA temp_directory='/tmp'", () => {
+    db.all(
+      "SELECT current_setting('memory_limit') AS ml, current_setting('temp_directory') AS td",
+      (err, rows) => {
+        if (err) {
+          return parentPort.postMessage({ type: "ready", ok: false, error: err.message });
+        }
+        parentPort.postMessage({
+          type: "ready",
+          ok: true,
+          memoryLimit: rows[0].ml,
+          tempDirectory: rows[0].td,
+        });
+        parentPort.on("message", (msg) => {
+          const finish = (e, result) =>
+            parentPort.postMessage(
+              e
+                ? { id: msg.id, ok: false, error: e.message }
+                : { id: msg.id, ok: true, rows: result },
+            );
+          if (msg.exec) db.exec(msg.sql, (e) => finish(e, null));
+          else db.all(msg.sql, (e, r) => finish(e, r));
+        });
+      },
+    );
+  });
+});
+`;
 
 export const PARQUET_DIR = process.env.PARQUET_DIR || "/data";
 
@@ -27,19 +77,6 @@ export class ParquetPeekError extends Error {
     super(message);
     this.status = status;
   }
-}
-
-function run(db, sql) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, (err, rows) => (err ? reject(err) : resolve(rows)));
-  });
-}
-
-/** db.exec() runs exactly ONE statement per call (memo gotcha). */
-function exec(db, sql) {
-  return new Promise((resolve, reject) => {
-    db.exec(sql, (err) => (err ? reject(err) : resolve()));
-  });
 }
 
 /** Single-quote a SQL string literal, escaping embedded quotes. */
@@ -104,25 +141,126 @@ export function normalizeValue(value) {
 }
 
 /**
- * Create a store bound to a directory. `db` is injectable for tests; the
- * default is a fresh in-memory DuckDB (the native binding is process-local).
+ * Create a store bound to a directory. All duckdb work runs in a dedicated
+ * worker thread so long scans never block the HTTP server. Call `close()` to
+ * terminate the worker (tests), otherwise it lives for the process lifetime.
  */
-export function createParquetStore(
-  dir = PARQUET_DIR,
-  db = new duckdb.Database(":memory:"),
-  options = {},
-) {
+export function createParquetStore(dir = PARQUET_DIR, options = {}) {
   const sampleTargetRows =
     options.sampleTargetRows ?? DEFAULT_SAMPLE_TARGET_ROWS;
 
-  // DuckDB cannot see the container cgroup (defaults to 80% of host RAM and
-  // never spills), so a runaway query OOM-kills the container instead. Cap
-  // DuckDB's own memory and give it a spill directory — it degrades to disk
-  // instead of dying. Cheap insurance on top of the bounded queries.
-  const pragmaReady = (async () => {
-    await exec(db, "PRAGMA memory_limit='1GB'");
-    await exec(db, "PRAGMA temp_directory='/tmp'");
-  })();
+  // Worker-thread plumbing: lazy spawn on first query; one worker per store
+  // (each owns its own in-memory duckdb Database + memory pragmas).
+  let worker = null;
+  let workerReady = null;
+  let nextId = 0;
+  let settings = null;
+  const pending = new Map();
+
+  function failAllPending(err) {
+    for (const [, p] of pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    pending.clear();
+  }
+
+  function ensureWorker() {
+    if (!worker) {
+      const w = new Worker(WORKER_SOURCE, {
+        eval: true,
+        workerData: { duckdbPath: DUCKDB_PATH },
+      });
+      worker = w;
+      workerReady = new Promise((resolve, reject) => {
+        w.on("message", (msg) => {
+          if (msg.type === "ready") {
+            if (msg.ok) {
+              settings = {
+                memoryLimit: msg.memoryLimit,
+                tempDirectory: msg.tempDirectory,
+              };
+              resolve();
+            } else {
+              reject(
+                new ParquetPeekError(
+                  500,
+                  `duckdb worker init failed: ${msg.error}`,
+                ),
+              );
+            }
+            return;
+          }
+          const p = pending.get(msg.id);
+          if (!p) return;
+          clearTimeout(p.timer);
+          pending.delete(msg.id);
+          if (msg.ok) p.resolve(msg.rows ?? []);
+          else
+            p.reject(
+              new ParquetPeekError(500, msg.error || "duckdb query failed"),
+            );
+        });
+        w.on("error", (err) => {
+          if (worker === w) worker = null;
+          failAllPending(
+            new ParquetPeekError(500, `duckdb worker error: ${err.message}`),
+          );
+        });
+        w.on("exit", (code) => {
+          if (code !== 0 && worker === w) {
+            worker = null;
+            failAllPending(
+              new ParquetPeekError(500, `duckdb worker exited (${code})`),
+            );
+          }
+        });
+      });
+    }
+    return workerReady;
+  }
+
+  /** Reject every in-flight query and kill the (possibly stuck) worker. */
+  function onQueryTimeout() {
+    const err = new ParquetPeekError(
+      504,
+      `duckdb query timed out after ${QUERY_TIMEOUT_MS}ms`,
+    );
+    failAllPending(err);
+    const w = worker;
+    worker = null;
+    if (w) w.terminate().catch(() => {});
+  }
+
+  /**
+   * Run a SQL statement in the worker and await its rows. If a query exceeds
+   * the timeout the worker is terminated (nothing keeps running or growing)
+   * and every in-flight request fails fast; the next call respawns it.
+   */
+  async function query(sql) {
+    await ensureWorker();
+    const id = ++nextId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(onQueryTimeout, QUERY_TIMEOUT_MS);
+      pending.set(id, { resolve, reject, timer });
+      worker.postMessage({ id, sql });
+    });
+  }
+
+  /** Terminate the worker (tests / shutdown). */
+  function close() {
+    failAllPending(new ParquetPeekError(500, "store closed"));
+    const w = worker;
+    worker = null;
+    workerReady = null;
+    if (w) w.terminate().catch(() => {});
+  }
+
+  /** DuckDB memory settings as applied inside the worker. */
+  async function getSettings() {
+    await ensureWorker();
+    return settings;
+  }
 
   let listingCache = { signature: null, data: null };
   const profileCache = new Map();
@@ -188,13 +326,11 @@ export function createParquetStore(
    */
   async function fetchFileMeta(name, stat) {
     const abs = path.join(dir, name);
-    const metadata = await run(
-      db,
+    const metadata = await query(
       `SELECT path_in_schema, type, row_group_id, row_group_num_rows, stats_min, stats_max, stats_null_count
 			 FROM parquet_metadata(${sqlString(abs)})`,
     );
-    const schema = await run(
-      db,
+    const schema = await query(
       `SELECT name, type, num_children FROM parquet_schema(${sqlString(abs)})`,
     );
 
@@ -238,7 +374,6 @@ export function createParquetStore(
 
   /** GET /api/files — cached listing; invalidated when file mtimes change. */
   async function listFiles() {
-    await pragmaReady;
     const names = parquetFileNames();
     const signature = names
       .map((n) => `${n}:${fs.statSync(path.join(dir, n)).mtimeMs}`)
@@ -291,7 +426,7 @@ export function createParquetStore(
            )
            SELECT count(*) AS __n, ${exprs} FROM sampled`
         : `SELECT count(*) AS __n, ${exprs} FROM read_parquet(${sqlString(abs)})`;
-    const rows = await run(db, sql);
+    const rows = await query(sql);
     const row = rows[0] || {};
     const out = { sampleN: Number(row.__n) || 0 };
     for (const c of columns) {
@@ -310,7 +445,6 @@ export function createParquetStore(
     if (cached && cached.mtimeMs === stat.mtimeMs) {
       return cached.data;
     }
-    await pragmaReady;
 
     const meta = await fetchFileMeta(name, stat);
     const { columns, rowCount, colStats } = meta;
@@ -362,7 +496,6 @@ export function createParquetStore(
     assertSafeFileName(name);
     const abs = path.join(dir, name);
     const stat = statOf(abs, name);
-    await pragmaReady;
     const n = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 100);
     const key = `${abs}:${n}`;
     const cached = previewCache.get(key);
@@ -370,16 +503,14 @@ export function createParquetStore(
       return cached.data;
     }
 
-    const rows = await run(
-      db,
+    const rows = await query(
       `SELECT * FROM read_parquet(${sqlString(abs)}) LIMIT ${n}`,
     );
     let columns;
     if (rows.length > 0) {
       columns = Object.keys(rows[0]);
     } else {
-      const schema = await run(
-        db,
+      const schema = await query(
         `SELECT name FROM parquet_schema(${sqlString(abs)})`,
       );
       columns = schema
@@ -396,7 +527,7 @@ export function createParquetStore(
     return data;
   }
 
-  return { listFiles, getProfile, getPreview };
+  return { listFiles, getProfile, getPreview, close, getSettings };
 }
 
 /** Shared singleton used by the API routes (tests build their own). */
