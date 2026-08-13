@@ -18,8 +18,8 @@ const duckdb = require("duckdb");
 
 export const PARQUET_DIR = process.env.PARQUET_DIR || "/data";
 
-/** Cap the sampled distinct scan to roughly this many rows (memo: 1–5M). */
-export const DEFAULT_SAMPLE_TARGET_ROWS = 2_000_000;
+/** Cap the sampled distinct scan to roughly this many rows (memo: ~0.28% of the 361M file ≈ 1M rows). */
+export const DEFAULT_SAMPLE_TARGET_ROWS = 1_000_000;
 
 /** Error carrying an HTTP status for the API routes. */
 export class ParquetPeekError extends Error {
@@ -107,6 +107,15 @@ export function createParquetStore(
 ) {
   const sampleTargetRows =
     options.sampleTargetRows ?? DEFAULT_SAMPLE_TARGET_ROWS;
+
+  // DuckDB cannot see the container cgroup (defaults to 80% of host RAM and
+  // never spills), so a runaway query OOM-kills the container instead. Cap
+  // DuckDB's own memory and give it a spill directory — it degrades to disk
+  // instead of dying. This is cheap insurance on top of the bounded queries.
+  const pragmaReady = (async () => {
+    await run(db, "PRAGMA memory_limit='1GB'");
+    await run(db, "PRAGMA temp_directory='/tmp'");
+  })();
 
   let listingCache = { signature: null, data: null };
   const profileCache = new Map();
@@ -222,6 +231,7 @@ export function createParquetStore(
 
   /** GET /api/files — cached listing; invalidated when file mtimes change. */
   async function listFiles() {
+    await pragmaReady;
     const names = parquetFileNames();
     const signature = names
       .map((n) => `${n}:${fs.statSync(path.join(dir, n)).mtimeMs}`)
@@ -251,13 +261,16 @@ export function createParquetStore(
   }
 
   /**
-   * Approximate distinct counts per column over a fixed-size reservoir
-   * sample. Reservoir sampling applies per row (a percentage sample gets
-   * pushed down to parquet row groups and can return 0 rows for a
-   * single-row-group file), so it always returns exactly
-   * min(sampleLimit, rowCount) rows — never an empty sample.
+   * Approximate distinct counts per column over a Bernoulli sample.
+   *
+   * The sample is applied as a streaming operator above the scan (per-row),
+   * so memory stays O(columns) regardless of file size — unlike a reservoir
+   * sample, which materializes the full sampled rows (2M rows of MBO data
+   * exceeded the 2 GiB container cap and OOM-killed the process). The scan
+   * itself reads the whole file, so the percentage is capped small
+   * (`sampleTargetRows`-ish rows) to bound I/O.
    */
-  async function sampleDistinct(abs, columns, sampleLimit) {
+  async function sampleDistinct(abs, columns, samplePct) {
     const exprs = columns
       .map(
         (c) =>
@@ -265,7 +278,9 @@ export function createParquetStore(
       )
       .join(", ");
     const sampleClause =
-      sampleLimit > 0 ? ` USING SAMPLE reservoir(${sampleLimit} ROWS)` : "";
+      samplePct !== null
+        ? ` USING SAMPLE ${samplePct} PERCENT (bernoulli)`
+        : "";
     const rows = await run(
       db,
       `SELECT count(*) AS __n, ${exprs} FROM read_parquet(${sqlString(abs)})${sampleClause}`,
@@ -288,15 +303,19 @@ export function createParquetStore(
     if (cached && cached.mtimeMs === stat.mtimeMs) {
       return cached.data;
     }
+    await pragmaReady;
 
     const meta = await fetchFileMeta(name, stat);
     const { columns, rowCount, colStats } = meta;
 
     // Sample only when the file is large; otherwise scan everything. The
-    // reservoir size caps the sampled scan to roughly sampleTargetRows.
+    // percentage targets ~sampleTargetRows rows but is capped at 0.5% so a
+    // mid-size file never triggers a big scan either (see OOM memo).
     const sampled = rowCount > sampleTargetRows;
-    const sampleLimit = sampled ? Math.min(sampleTargetRows, rowCount) : 0;
-    const distinct = await sampleDistinct(abs, columns, sampleLimit);
+    const samplePct = sampled
+      ? Math.min(0.5, Number(((sampleTargetRows / rowCount) * 100).toFixed(4)))
+      : null;
+    const distinct = await sampleDistinct(abs, columns, samplePct);
 
     const profileColumns = columns.map((c) => {
       const st = colStats.get(c.name) || { nullCount: 0, min: null, max: null };
@@ -328,6 +347,7 @@ export function createParquetStore(
     assertSafeFileName(name);
     const abs = path.join(dir, name);
     const stat = statOf(abs, name);
+    await pragmaReady;
     const n = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 100);
     const key = `${abs}:${n}`;
     const cached = previewCache.get(key);

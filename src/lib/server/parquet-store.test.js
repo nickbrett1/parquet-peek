@@ -76,13 +76,14 @@ describe("normalizeValue", () => {
 describe("createParquetStore", () => {
   let tmpDir;
   let db;
-  let store;
+  let storeA; // sampleTargetRows 2000 -> fixture.parquet (1000 rows) is NOT sampled
+  let storeB; // sampleTargetRows 500 -> big-fixture.parquet (500K rows) IS sampled
 
   beforeAll(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "parquet-peek-test-"));
     db = new duckdb.Database(":memory:");
 
-    // Create fixture table with varied types & nulls
+    // Small fixture with varied types & nulls (single row group).
     await run(
       db,
       `CREATE TABLE ticks AS SELECT
@@ -101,7 +102,27 @@ describe("createParquetStore", () => {
       `COPY ticks TO '${path.join(tmpDir, "fixture.parquet").replace(/'/g, "''")}' (FORMAT PARQUET)`,
     );
 
-    // Tiny second file
+    // Large fixture with MANY row groups (50) so the Bernoulli sample is
+    // applied per-row (streaming) rather than whole-row-group-or-nothing.
+    await run(
+      db,
+      `CREATE TABLE big AS SELECT
+				i AS sequence,
+				CASE WHEN i % 2 = 0 THEN 100.0 + (i % 5) * 0.5 ELSE NULL END AS price,
+				(i % 7) * 100 AS size,
+				CAST(i * 1000 AS BIGINT) AS seq,
+				TIMESTAMP '2024-08-05 13:30:00' + (i * INTERVAL 1 SECOND) AS ts_event,
+				'SYM' || (i % 50) AS symbol,
+				i % 3 AS rtype
+			FROM range(500000) t(i)`,
+    );
+
+    await run(
+      db,
+      `COPY big TO '${path.join(tmpDir, "big-fixture.parquet").replace(/'/g, "''")}' (FORMAT PARQUET, ROW_GROUP_SIZE 10000)`,
+    );
+
+    // Tiny file
     await run(
       db,
       `COPY (SELECT 1 AS col_a) TO '${path.join(tmpDir, "tiny.parquet").replace(/'/g, "''")}' (FORMAT PARQUET)`,
@@ -113,7 +134,8 @@ describe("createParquetStore", () => {
       `COPY (SELECT 1 AS col_empty WHERE false) TO '${path.join(tmpDir, "empty.parquet").replace(/'/g, "''")}' (FORMAT PARQUET)`,
     );
 
-    store = createParquetStore(tmpDir, db, { sampleTargetRows: 500 });
+    storeA = createParquetStore(tmpDir, db, { sampleTargetRows: 2000 });
+    storeB = createParquetStore(tmpDir, db, { sampleTargetRows: 500 });
   });
 
   afterAll(() => {
@@ -123,9 +145,10 @@ describe("createParquetStore", () => {
   });
 
   it("listFiles lists parquet files sorted with metadata and caches results", async () => {
-    const res1 = await store.listFiles();
-    expect(res1.files).toHaveLength(3);
+    const res1 = await storeA.listFiles();
+    expect(res1.files).toHaveLength(4);
     expect(res1.files.map((f) => f.name)).toEqual([
+      "big-fixture.parquet",
       "empty.parquet",
       "fixture.parquet",
       "tiny.parquet",
@@ -139,16 +162,16 @@ describe("createParquetStore", () => {
     expect(fix.maxTs).not.toBeNull();
 
     // Second call returns cached result
-    const res2 = await store.listFiles();
+    const res2 = await storeA.listFiles();
     expect(res2).toBe(res1);
   });
 
-  it("getProfile computes column metrics for non-sampled and sampled files", async () => {
-    // fixture.parquet has 1000 rows > sampleTargetRows (500) -> sampled = true
-    const prof = await store.getProfile("fixture.parquet");
+  it("getProfile on a small file scans everything (sampled=false)", async () => {
+    // fixture.parquet has 1000 rows <= sampleTargetRows (2000) -> full scan
+    const prof = await storeA.getProfile("fixture.parquet");
     expect(prof.file).toBe("fixture.parquet");
     expect(prof.rowCount).toBe(1000);
-    expect(prof.sampled).toBe(true);
+    expect(prof.sampled).toBe(false);
     expect(prof.columns).toHaveLength(7);
 
     const priceCol = prof.columns.find((c) => c.name === "price");
@@ -157,20 +180,37 @@ describe("createParquetStore", () => {
     expect(priceCol.min).not.toBeNull();
     expect(priceCol.max).not.toBeNull();
     expect(priceCol.distinctApprox).toBeGreaterThan(0);
-    // Reservoir sampling returns exactly the target size, deterministically.
-    expect(priceCol.sampleN).toBe(500);
+    // Full scan -> sampleN equals row count
+    expect(priceCol.sampleN).toBe(1000);
 
-    // Cached profile call
-    const profCached = await store.getProfile("fixture.parquet");
+    // Cached profile call returns the same object
+    const profCached = await storeA.getProfile("fixture.parquet");
     expect(profCached).toBe(prof);
 
-    // tiny.parquet has 1 row <= sampleTargetRows (500) -> sampled = false
-    const tinyProf = await store.getProfile("tiny.parquet");
+    // tiny.parquet has 1 row -> also not sampled
+    const tinyProf = await storeA.getProfile("tiny.parquet");
     expect(tinyProf.sampled).toBe(false);
   });
 
+  it("getProfile on a large file uses a bounded Bernoulli sample (sampled=true)", async () => {
+    // big-fixture.parquet has 500K rows > sampleTargetRows (500) -> sampled.
+    // pct = min(0.5, 500/500000*100) = 0.1% -> ~500 rows expected.
+    const prof = await storeB.getProfile("big-fixture.parquet");
+    expect(prof.sampled).toBe(true);
+    expect(prof.rowCount).toBe(500000);
+
+    const priceCol = prof.columns.find((c) => c.name === "price");
+    expect(priceCol.nullCount).toBe(250000);
+    expect(priceCol.nullPct).toBe(50);
+    expect(priceCol.distinctApprox).toBeGreaterThan(0);
+    // Bernoulli sample: ~0.1% of 500K rows, streaming per-row on a 50-group
+    // file. Assert a sane bounded range (never 0, never the whole file).
+    expect(priceCol.sampleN).toBeGreaterThan(0);
+    expect(priceCol.sampleN).toBeLessThan(50000);
+  });
+
   it("getPreview returns top N rows and supports limits and empty files", async () => {
-    const prev = await store.getPreview("fixture.parquet", 10);
+    const prev = await storeA.getPreview("fixture.parquet", 10);
     expect(prev.file).toBe("fixture.parquet");
     expect(prev.limit).toBe(10);
     expect(prev.columns).toContain("symbol");
@@ -178,21 +218,32 @@ describe("createParquetStore", () => {
     expect(prev.rows[0][0]).toBe("AAPL");
 
     // Limit clamping
-    const clampedPrev = await store.getPreview("fixture.parquet", 500);
+    const clampedPrev = await storeA.getPreview("fixture.parquet", 500);
     expect(clampedPrev.limit).toBe(100);
 
     // Default limit when invalid
-    const defaultPrev = await store.getPreview("fixture.parquet", "invalid");
+    const defaultPrev = await storeA.getPreview("fixture.parquet", "invalid");
     expect(defaultPrev.limit).toBe(20);
 
     // Empty file preview
-    const emptyPrev = await store.getPreview("empty.parquet", 10);
+    const emptyPrev = await storeA.getPreview("empty.parquet", 10);
     expect(emptyPrev.rows).toHaveLength(0);
     expect(emptyPrev.columns).toEqual(["col_empty"]);
   });
 
+  it("caps duckdb memory so a runaway query spills instead of OOM-killing", async () => {
+    const row = await run(
+      db,
+      "SELECT current_setting('memory_limit') AS ml, current_setting('temp_directory') AS td",
+    );
+    expect(row[0].td).toBe("/tmp");
+    const mb = Number.parseFloat(row[0].ml);
+    expect(Number.isFinite(mb)).toBe(true);
+    expect(mb).toBeLessThan(2048); // set to 1GB, not the default 80% of host RAM
+  });
+
   it("throws 404 for missing file and 500 for invalid directory", async () => {
-    await expect(store.getProfile("nonexistent.parquet")).rejects.toThrow(
+    await expect(storeA.getProfile("nonexistent.parquet")).rejects.toThrow(
       ParquetPeekError,
     );
 
