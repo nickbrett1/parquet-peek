@@ -14,15 +14,17 @@ services:
     restart: unless-stopped
 
     ports:
-      - "3000:3000"
-
+      - "127.0.0.1:3002:3000"
+    volumes:
+      - /volume1/marketdata/backup/parquet:/data:ro
     environment:
       # Set your environment variables here or in a NAS-side .env file
       # (genproj never commits secrets). See .env.example.
+      PARQUET_DIR: ${PARQUET_DIR:-/data}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
       - "homepage.group=Services"
       - "homepage.name=parquet-peek"
-      - "homepage.href=http://localhost:3000/"
+      - "homepage.href=http://nas:3000/"
       - "homepage.widget.type=customapi"
       - "homepage.widget.url=http://localhost:3000/health"

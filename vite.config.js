@@ -7,6 +7,15 @@ export default defineConfig({
 		reporter: ['default', 'junit'],
 		outputFile: {
 			junit: './reports/junit.xml'
+		},
+		coverage: {
+			reporter: ['lcov', 'text'],
+			thresholds: {
+				statements: 80,
+				branches: 75,
+				functions: 80,
+				lines: 80
+			}
 		}
 	}
 });

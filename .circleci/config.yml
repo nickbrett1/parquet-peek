@@ -1,7 +1,6 @@
 version: 2.1
 orbs:
   node: circleci/node@5.0.2
-
 jobs:
   build:
     executor: node/default
@@ -28,11 +27,11 @@ jobs:
           name: Build
           command: npm run build
       - run:
-          name: Test with Coverage
-          command: npx vitest --coverage
-      - run:
           name: Lint (ESLint + SonarJS)
           command: npm run lint
+      - run:
+          name: Test with Coverage
+          command: npx vitest --coverage
 
 
 
@@ -50,7 +49,7 @@ jobs:
           name: Build and Push Multi-Arch Image
           command: |
             docker buildx create --use || true
-            docker buildx build --platform linux/amd64,linux/arm64 --provenance=false \
+            docker buildx build --platform linux/amd64,linux/arm64 \
               -t ghcr.io/nickbrett1/parquet-peek:$CIRCLE_SHA1 -t ghcr.io/nickbrett1/parquet-peek:latest --push .
 workflows:
   build-and-test:

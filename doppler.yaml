@@ -1,0 +1,3 @@
+setup:
+  project: parquet-peek
+  config: dev

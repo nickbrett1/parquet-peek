@@ -29,7 +29,8 @@
     "source=parquet-peek-wrangler-config,target=/home/node/.wrangler,type=volume",
     "source=parquet-peek-doppler-config,target=/home/node/.doppler,type=volume",
     "source=gemini-cli-settings,target=/home/node/.gemini,type=volume",
-    "source=parquet-peek-tailscale-state,target=/var/lib/tailscale,type=volume"
+    "source=parquet-peek-tailscale-state,target=/var/lib/tailscale,type=volume",
+    "source=${localEnv:HOME}/.config/goose,target=/home/node/.config/goose,type=bind"
   ],
   "forwardPorts": [
     8788,
@@ -56,7 +57,8 @@
         "unifiedjs.vscode-mdx",
         "ecmel.vscode-html-css",
         "GraphQL.vscode-graphql-syntax",
-        "ms-azuretools.vscode-docker"
+        "ms-azuretools.vscode-docker",
+        "doppler.doppler-vscode"
       ]
     }
   }

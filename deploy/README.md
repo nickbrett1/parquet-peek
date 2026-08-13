@@ -11,8 +11,26 @@ multi-arch image (linux/amd64 + linux/arm64) and pushes it to
 
 - The registry namespace (`nickbrett1`) is derived from the
   authenticated GitHub identity at generation time.
-- Registry credentials are read from the CircleCI context (`ghcr.io`):
-  - `GHCR_USERNAME` + `GHCR_TOKEN` (fine-grained PAT with Packages: read & write)
+- Registry credentials are read from the CircleCI context (`common`):
+  - `GHCR_USERNAME` — the GitHub account name
+  - `GHCR_TOKEN` — a **classic** PAT with the `write:packages` scope
+
+### One-time CI setup (CircleCI context)
+
+Before the first push can publish an image, the CircleCI context must exist
+with the registry credentials:
+
+1. CircleCI -> Organization Settings -> Contexts -> Create Context, and name
+   it `common` (this is what the generated pipeline reads).
+2. Add two environment variables to the context:
+   - `GHCR_USERNAME` = your GitHub username
+   - `GHCR_TOKEN` = a **classic** personal access token with the
+     `write:packages` scope — create one at
+     https://github.com/settings/tokens/new?scopes=write:packages (the UI
+     auto-selects the `repo` scope alongside it)
+
+> GitHub **fine-grained** PATs cannot access the Container registry (GHCR)
+> yet, and offer no "Packages: read & write" permission — do not use one here.
 
 ## 2. Deploy on the NAS (Synology Container Manager)
 
@@ -70,3 +88,27 @@ enable the `homepage` Docker provider) to show a health widget for the service.
 Configure `dataMounts` in the genproj configuration to mount host directories
 into the container, e.g. `[{ "hostPath": "/volume1/marketdata", "containerPath": "/data", "readOnly": true }]`.
 They are emitted into the compose `volumes:` section (read-only by default).
+
+## 8. Healthchecks, env vars and system packages
+
+All three are config-driven on the `docker-container` capability — the
+generated Dockerfile, compose file and Homepage widget stay consistent:
+
+- `healthcheck`: `none` (default for Python), `http:<path>` (e.g.
+  `http:/healthz`; installs `curl` on Python images), or `command:<cmd>`.
+  The Homepage widget is only emitted when a real health endpoint exists.
+- `envVars`: emitted into the compose `environment:` and `.env.example`
+  (e.g. `["MCP_PORT=3001"]`). Compose entries use `${KEY:-default}`
+  interpolation so a NAS-side `.env` can override them.
+- `pythonDependencies`: runtime Python deps emitted into `[project]`
+  dependencies of `pyproject.toml` (e.g. `["mcp>=1.2.0", "mcpo>=0.1.0",
+  "httpx>=0.27.0"]`).
+- `aptPackages`: Debian packages installed in the runtime image via apt
+  (e.g. `["iproute2", "curl"]`).
+- `command` / `entrypoint`: override the container CMD/ENTRYPOINT (exec form,
+  e.g. `"command": ["/usr/local/bin/entrypoint.sh"]`). When the value points at
+  `/usr/local/bin/<script>`, genproj copies `scripts/<script>` from your repo
+  into the image (chmod +x) — keep the script in `scripts/`.
+
+Regenerate with `overwrite: true` to apply these to an existing repo — existing
+app code is preserved; only generated infra files are updated.

@@ -7,8 +7,6 @@
 CURRENT_USER=$(whoami)
 USER_HOME_DIR="$HOME"
 
-echo "INFO: Ensuring wrangler directory permissions..."
-
 echo "INFO: Restoring or backing up SSH host keys..."
 sudo mkdir -p /var/lib/tailscale/ssh
 if [ -n "$(ls -A /var/lib/tailscale/ssh/ssh_host_* 2>/dev/null)" ]; then
@@ -24,16 +22,20 @@ fi
 
 echo "INFO: Ensuring SSH service is running..."
 sudo service ssh restart
-mkdir -p "$USER_HOME_DIR/.wrangler"
-sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME_DIR/.wrangler"
 
 echo "INFO: Ensuring doppler directory permissions..."
 mkdir -p "$USER_HOME_DIR/.doppler"
 sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME_DIR/.doppler"
+# Round-5 (memo genproj-fixes-round5): guarantee the CLI is on PATH. The
+# Dockerfile installs it for fresh projects, but a regenerated project whose
+# Dockerfile was preserved (round-3 idempotent overwrite) needs the fallback.
+# (A devcontainer feature was tried first but ghcr.io/devcontainers-contrib
+# features are no longer reliably pullable — 'denied'.)
+if ! command -v doppler &> /dev/null; then
+    echo "INFO: Installing Doppler CLI (fallback)..."
+    (curl -Ls --tlsv1.2 --proto "=https" --retry 3 https://cli.doppler.com/install.sh || wget -t 3 -qO- https://cli.doppler.com/install.sh) | sudo sh
+fi
 
-echo "INFO: Ensuring gemini directory permissions..."
-mkdir -p "$USER_HOME_DIR/.gemini"
-sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME_DIR/.gemini"
 
 echo "INFO: Creating Oh My Zsh custom directories..."
 mkdir -p "$USER_HOME_DIR/.oh-my-zsh/custom/themes" "$USER_HOME_DIR/.oh-my-zsh/custom/plugins"
@@ -77,14 +79,57 @@ echo "INFO: Installing git pre-commit hooks (lint-staged)..."
 
 
 
+echo "INFO: Setting up goose configuration and MCP servers..."
 
-echo "INFO: Installing specdag globally..."
-npm install -g @japorto100/specdag
+# Create goose config directory
+mkdir -p "$HOME/.config/goose"
 
-if ! pgrep -f "socat TCP-LISTEN:9222" > /dev/null; then
-    echo "Setup bridget to access Chrome DevTools Protocol over a secure tunnel..."
-    sudo start-stop-daemon --start --background --pidfile /var/run/socat-9222.pid --make-pidfile --chuid $(id -un):$(id -gn) --exec /usr/bin/socat -- TCP-LISTEN:9222,fork,bind=127.0.0.1 TCP:host.docker.internal:9222
+# Never overwrite an existing goose config: the user's real config.yaml
+# (provider + extensions) is bind-mounted into the devcontainer. Clobbering it
+# drops the configured provider and surfaces as:
+#   error: No provider configured. Run 'goose configure' first.
+if [ -f "$HOME/.config/goose/config.yaml" ]; then
+    echo "INFO: Keeping existing $HOME/.config/goose/config.yaml (provider + extensions preserved)."
+else
+    echo "INFO: No goose config found yet - run 'goose configure' inside the container to set up your provider."
 fi
+
+echo "INFO: Registering project-selected goose MCP extensions..."
+
+# Idempotently register a project-selected goose MCP extension. Never clobbers:
+# skips keys already present, only appends the missing block under extensions:.
+ensure_goose_extension() {
+  local key="$1" block="$2" config="$HOME/.config/goose/config.yaml"
+  [ -f "$config" ] || { echo "WARN: no goose config yet - project extensions apply after 'goose configure'"; return 0; }
+  grep -qE "^  ${key}:" "$config" && { echo "INFO: goose extension '${key}' already registered."; return 0; }
+  grep -q '^extensions:' "$config" || echo "extensions:" >> "$config"
+  awk -v frag="$block" '/^extensions:/ { print; printf "%s", frag; next } { print }' "$config" > "${config}.tmp" && mv "${config}.tmp" "$config"
+  echo "INFO: Registered goose extension '${key}'."
+}
+
+ensure_goose_extension "circleci" '  circleci:
+    type: stdio
+    name: circleci
+    enabled: true
+    cmd: doppler
+    args: ["run", "--", "npx", "-y", "@circleci/mcp-server-circleci"]
+    timeout: 300
+'
+
+echo "INFO: Ensuring goose recipes are available (spec-first development process)..."
+RECIPES_DIR="$HOME/.config/goose/recipes"
+if [ -d "$RECIPES_DIR/.git" ]; then
+    (cd "$RECIPES_DIR" && git pull --ff-only --quiet)         || echo "WARN: Could not update goose-recipes (offline or conflict); keeping existing copy."
+else
+    mkdir -p "$HOME/.config/goose"
+    git clone --quiet https://github.com/nickbrett1/goose-recipes.git "$RECIPES_DIR"         || echo "WARN: Could not clone goose-recipes; recipes will be unavailable."
+fi
+
+echo "INFO: goose configuration complete."
+
+
+
+
 
 echo "INFO: Checking Tailscale status..."
 if ! command -v tailscale &> /dev/null; then
@@ -97,11 +142,6 @@ if ! pgrep -x tailscaled > /dev/null; then
     sudo start-stop-daemon --start --background --oknodo --pidfile /var/run/tailscaled.pid --make-pidfile --exec /usr/sbin/tailscaled -- --state=/var/lib/tailscale/tailscaled.state
 fi
 
-echo "INFO: Checking Nanobanana MCP installation..."
-if [ -f "webapp/scripts/install-nanobanana.sh" ]; then
-    bash webapp/scripts/install-nanobanana.sh
-elif [ -f "scripts/install-nanobanana.sh" ]; then
-    bash scripts/install-nanobanana.sh
-fi
-
-echo "INFO: Custom container setup script finished."
+echo -e "\nINFO: Custom container setup script finished."
+echo -e "\n⚠️  To complete cloud login, run:"
+echo "    cd /workspaces/parquet-peek && bash scripts/cloud_login.sh"
