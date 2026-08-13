@@ -4,7 +4,7 @@
 //   - Manifest (metadata fast path): parquet_metadata + parquet_schema footers,
 //     no data scan — instant even for multi-GB files.
 //   - Profile (on-demand, cached): footer stats for null/min/max plus
-//     approx_count_distinct() over a Bernoulli sample, capped to a few M rows.
+//     approx_count_distinct() over a fixed-size reservoir sample.
 //   - Preview: SELECT * ... LIMIT n (row-group pushdown, sub-second).
 //
 // All reads are metadata/limited-scan only; the data mount is read-only.
@@ -20,8 +20,6 @@ export const PARQUET_DIR = process.env.PARQUET_DIR || "/data";
 
 /** Cap the sampled distinct scan to roughly this many rows (memo: 1–5M). */
 export const DEFAULT_SAMPLE_TARGET_ROWS = 2_000_000;
-/** Never sample below this percentage, whatever the file size. */
-export const MIN_SAMPLE_PERCENT = 0.01;
 
 /** Error carrying an HTTP status for the API routes. */
 export class ParquetPeekError extends Error {
@@ -252,8 +250,14 @@ export function createParquetStore(
     return listingCache.data;
   }
 
-  /** Approximate distinct counts per column over a (possibly sampled) scan. */
-  async function sampleDistinct(abs, columns, samplePct) {
+  /**
+   * Approximate distinct counts per column over a fixed-size reservoir
+   * sample. Reservoir sampling applies per row (a percentage sample gets
+   * pushed down to parquet row groups and can return 0 rows for a
+   * single-row-group file), so it always returns exactly
+   * min(sampleLimit, rowCount) rows — never an empty sample.
+   */
+  async function sampleDistinct(abs, columns, sampleLimit) {
     const exprs = columns
       .map(
         (c) =>
@@ -261,7 +265,7 @@ export function createParquetStore(
       )
       .join(", ");
     const sampleClause =
-      samplePct < 100 ? ` USING SAMPLE ${samplePct} PERCENT` : "";
+      sampleLimit > 0 ? ` USING SAMPLE reservoir(${sampleLimit} ROWS)` : "";
     const rows = await run(
       db,
       `SELECT count(*) AS __n, ${exprs} FROM read_parquet(${sqlString(abs)})${sampleClause}`,
@@ -288,16 +292,11 @@ export function createParquetStore(
     const meta = await fetchFileMeta(name, stat);
     const { columns, rowCount, colStats } = meta;
 
-    let samplePct = 100;
-    let sampled = false;
-    if (rowCount > sampleTargetRows) {
-      samplePct = Math.max(
-        MIN_SAMPLE_PERCENT,
-        Math.min(100, (sampleTargetRows / rowCount) * 100),
-      );
-      sampled = true;
-    }
-    const distinct = await sampleDistinct(abs, columns, samplePct);
+    // Sample only when the file is large; otherwise scan everything. The
+    // reservoir size caps the sampled scan to roughly sampleTargetRows.
+    const sampled = rowCount > sampleTargetRows;
+    const sampleLimit = sampled ? Math.min(sampleTargetRows, rowCount) : 0;
+    const distinct = await sampleDistinct(abs, columns, sampleLimit);
 
     const profileColumns = columns.map((c) => {
       const st = colStats.get(c.name) || { nullCount: 0, min: null, max: null };

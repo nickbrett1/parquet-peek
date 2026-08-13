@@ -157,6 +157,8 @@ describe("createParquetStore", () => {
     expect(priceCol.min).not.toBeNull();
     expect(priceCol.max).not.toBeNull();
     expect(priceCol.distinctApprox).toBeGreaterThan(0);
+    // Reservoir sampling returns exactly the target size, deterministically.
+    expect(priceCol.sampleN).toBe(500);
 
     // Cached profile call
     const profCached = await store.getProfile("fixture.parquet");
