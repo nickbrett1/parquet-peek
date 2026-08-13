@@ -163,6 +163,20 @@ agy-dev() {
 # Overrides the bare `goose` binary (which can't work standalone: it needs Doppler secrets).
 goose() {
   echo "Starting goose with Doppler (common + goose)..."
+  # Doppler auth pre-flight: fail with actionable guidance instead of the cryptic
+  # "Doppler Error: you must provide a token" that 'doppler run' emits when the
+  # container has no Doppler auth (fresh devcontainer / codespace).
+  if ! command -v doppler &> /dev/null; then
+    echo "❌ Doppler CLI not found - goose needs Doppler secrets to start."
+    echo "   Finish the devcontainer post-create setup (it installs the CLI), then try again."
+    return 127
+  fi
+  if ! doppler whoami &> /dev/null 2>&1; then
+    echo "❌ Not authenticated with Doppler - goose needs Doppler secrets to start."
+    echo "   Run: bash scripts/cloud_login.sh   (interactive browser login)"
+    echo "   Or set a service token:  export DOPPLER_TOKEN=dp.st.<token>"
+    return 1
+  fi
   # Load common secrets first, then layer goose project secrets on top.
   # Uses 'prd' config for the goose project to pick up LITELLM endpoint env vars.
   # --forward-signals ensures SIGINT/SIGTERM are correctly passed through to goose.
