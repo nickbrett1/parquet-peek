@@ -4,7 +4,7 @@
 //   - Manifest (metadata fast path): parquet_metadata + parquet_schema footers,
 //     no data scan — instant even for multi-GB files.
 //   - Profile (on-demand, cached): footer stats for null/min/max plus
-//     approx_count_distinct() over a fixed-size reservoir sample.
+//     approx_count_distinct() over a Bernoulli % sample (~1M rows).
 //   - Preview: SELECT * ... LIMIT n (row-group pushdown, sub-second).
 //
 // All reads are metadata/limited-scan only; the data mount is read-only.
@@ -32,6 +32,13 @@ export class ParquetPeekError extends Error {
 function run(db, sql) {
   return new Promise((resolve, reject) => {
     db.all(sql, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
+
+/** db.exec() runs exactly ONE statement per call (memo gotcha). */
+function exec(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (err) => (err ? reject(err) : resolve()));
   });
 }
 
@@ -111,10 +118,10 @@ export function createParquetStore(
   // DuckDB cannot see the container cgroup (defaults to 80% of host RAM and
   // never spills), so a runaway query OOM-kills the container instead. Cap
   // DuckDB's own memory and give it a spill directory — it degrades to disk
-  // instead of dying. This is cheap insurance on top of the bounded queries.
+  // instead of dying. Cheap insurance on top of the bounded queries.
   const pragmaReady = (async () => {
-    await run(db, "PRAGMA memory_limit='1GB'");
-    await run(db, "PRAGMA temp_directory='/tmp'");
+    await exec(db, "PRAGMA memory_limit='1GB'");
+    await exec(db, "PRAGMA temp_directory='/tmp'");
   })();
 
   let listingCache = { signature: null, data: null };
@@ -263,28 +270,28 @@ export function createParquetStore(
   /**
    * Approximate distinct counts per column over a Bernoulli sample.
    *
-   * The sample is applied as a streaming operator above the scan (per-row),
-   * so memory stays O(columns) regardless of file size — unlike a reservoir
-   * sample, which materializes the full sampled rows (2M rows of MBO data
-   * exceeded the 2 GiB container cap and OOM-killed the process). The scan
-   * itself reads the whole file, so the percentage is capped small
-   * (`sampleTargetRows`-ish rows) to bound I/O.
+   * The sample is a streaming operator above the scan (per-row), so memory
+   * stays O(columns) regardless of file size. The CTE keeps the sample
+   * visible to the optimizer (it cannot be eliminated) and the percentage is
+   * sized to ~sampleTargetRows rows, bounding both memory and I/O. This is
+   * the OOM-memo's prescribed shape: one pass, all columns, HLL.
    */
   async function sampleDistinct(abs, columns, samplePct) {
     const exprs = columns
       .map(
         (c) =>
-          `approx_count_distinct(CAST(${sqlIdent(c.name)} AS VARCHAR)) AS ${sqlIdent("__d_" + c.name)}`,
+          `approx_count_distinct(${sqlIdent(c.name)}) AS ${sqlIdent("__d_" + c.name)}`,
       )
       .join(", ");
-    const sampleClause =
+    const sql =
       samplePct !== null
-        ? ` USING SAMPLE ${samplePct} PERCENT (bernoulli)`
-        : "";
-    const rows = await run(
-      db,
-      `SELECT count(*) AS __n, ${exprs} FROM read_parquet(${sqlString(abs)})${sampleClause}`,
-    );
+        ? `WITH sampled AS (
+             SELECT * FROM read_parquet(${sqlString(abs)})
+             USING SAMPLE ${samplePct} PERCENT (bernoulli)
+           )
+           SELECT count(*) AS __n, ${exprs} FROM sampled`
+        : `SELECT count(*) AS __n, ${exprs} FROM read_parquet(${sqlString(abs)})`;
+    const rows = await run(db, sql);
     const row = rows[0] || {};
     const out = { sampleN: Number(row.__n) || 0 };
     for (const c of columns) {
@@ -309,13 +316,21 @@ export function createParquetStore(
     const { columns, rowCount, colStats } = meta;
 
     // Sample only when the file is large; otherwise scan everything. The
-    // percentage targets ~sampleTargetRows rows but is capped at 0.5% so a
-    // mid-size file never triggers a big scan either (see OOM memo).
+    // percentage targets ~sampleTargetRows rows (memo: 1M/361M ≈ 0.28%).
     const sampled = rowCount > sampleTargetRows;
     const samplePct = sampled
-      ? Math.min(0.5, Number(((sampleTargetRows / rowCount) * 100).toFixed(4)))
+      ? Number(((sampleTargetRows / rowCount) * 100).toFixed(4))
       : null;
+    const t0 = Date.now();
     const distinct = await sampleDistinct(abs, columns, samplePct);
+    if (sampled && distinct.sampleN === 0) {
+      console.warn(
+        `[profile] ${name}: Bernoulli sample produced 0 rows (pct=${samplePct}) — check EXPLAIN; the sample must survive the optimizer`,
+      );
+    }
+    console.log(
+      `[profile] ${name} rows=${rowCount} sampled=${sampled} pct=${samplePct} sampleN=${distinct.sampleN} elapsed=${Date.now() - t0}ms`,
+    );
 
     const profileColumns = columns.map((c) => {
       const st = colStats.get(c.name) || { nullCount: 0, min: null, max: null };
