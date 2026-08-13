@@ -61,6 +61,4 @@ fi
 
 
 
-
-
 echo "Cloud login script finished."

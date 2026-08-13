@@ -25,6 +25,6 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"
       - "homepage.group=Services"
       - "homepage.name=parquet-peek"
-      - "homepage.href=http://nas:3000/"
+      - "homepage.href=http://nas:3002/"
       - "homepage.widget.type=customapi"
-      - "homepage.widget.url=http://localhost:3000/health"
+      - "homepage.widget.url=http://localhost:3002/health"
