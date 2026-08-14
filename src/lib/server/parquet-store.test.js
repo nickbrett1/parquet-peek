@@ -194,9 +194,9 @@ describe("createParquetStore", () => {
     expect(tinyProf.sampled).toBe(false);
   });
 
-  it("getProfile on a large file uses a bounded Bernoulli sample (sampled=true)", async () => {
+  it("getProfile on a large file uses a LIMIT-bounded slice (sampled=true)", async () => {
     // big-fixture.parquet has 500K rows > sampleTargetRows (500) -> sampled.
-    // pct = min(0.5, 500/500000*100) = 0.1% -> ~500 rows expected.
+    // The LIMIT pushdown slice reads exactly sampleTargetRows rows.
     const prof = await storeB.getProfile("big-fixture.parquet");
     expect(prof.sampled).toBe(true);
     expect(prof.rowCount).toBe(500000);
@@ -205,10 +205,8 @@ describe("createParquetStore", () => {
     expect(priceCol.nullCount).toBe(250000);
     expect(priceCol.nullPct).toBe(50);
     expect(priceCol.distinctApprox).toBeGreaterThan(0);
-    // Bernoulli sample: ~0.1% of 500K rows, streaming per-row on a 50-group
-    // file. Assert a sane bounded range (never 0, never the whole file).
-    expect(priceCol.sampleN).toBeGreaterThan(0);
-    expect(priceCol.sampleN).toBeLessThan(50000);
+    // LIMIT pushdown: the slice is exactly the target size, deterministically.
+    expect(priceCol.sampleN).toBe(500);
   });
 
   it("getPreview returns top N rows and supports limits and empty files", async () => {

@@ -4,7 +4,7 @@
 //   - Manifest (metadata fast path): parquet_metadata + parquet_schema footers,
 //     no data scan — instant even for multi-GB files.
 //   - Profile (on-demand, cached): footer stats for null/min/max plus
-//     approx_count_distinct() over a Bernoulli % sample (~1M rows).
+//     approx_count_distinct() over a LIMIT-bounded slice (~1M rows).
 //   - Preview: SELECT * ... LIMIT n (row-group pushdown, sub-second).
 //
 // All reads are metadata/limited-scan only; the data mount is read-only.
@@ -403,15 +403,16 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
   }
 
   /**
-   * Approximate distinct counts per column over a Bernoulli sample.
+   * Approximate distinct counts per column over a LIMIT-bounded slice.
    *
-   * The sample is a streaming operator above the scan (per-row), so memory
-   * stays O(columns) regardless of file size. The CTE keeps the sample
-   * visible to the optimizer (it cannot be eliminated) and the percentage is
-   * sized to ~sampleTargetRows rows, bounding both memory and I/O. This is
-   * the OOM-memo's prescribed shape: one pass, all columns, HLL.
+   * The subquery form pushes the LIMIT into the parquet scan, so only the
+   * first ~sampleLimit rows are read (~1 row group ≈ 16 MB for the big file)
+   * instead of a full 5.8 GB scan. A full scan is what filled the container's
+   * cgroup (page cache / buffers) and got it OOM-killed at 2 GiB on the NAS,
+   * even though Bernoulli sampling itself is memory-flat. The result is one
+   * aggregated row (count + one HLL per column) — never table rows.
    */
-  async function sampleDistinct(abs, columns, samplePct) {
+  async function sampleDistinct(abs, columns, sampleLimit) {
     const exprs = columns
       .map(
         (c) =>
@@ -419,12 +420,10 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
       )
       .join(", ");
     const sql =
-      samplePct !== null
-        ? `WITH sampled AS (
-             SELECT * FROM read_parquet(${sqlString(abs)})
-             USING SAMPLE ${samplePct} PERCENT (bernoulli)
-           )
-           SELECT count(*) AS __n, ${exprs} FROM sampled`
+      sampleLimit !== null
+        ? `SELECT count(*) AS __n, ${exprs} FROM (
+             SELECT * FROM read_parquet(${sqlString(abs)}) LIMIT ${sampleLimit}
+           )`
         : `SELECT count(*) AS __n, ${exprs} FROM read_parquet(${sqlString(abs)})`;
     const rows = await query(sql);
     const row = rows[0] || {};
@@ -450,20 +449,19 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
     const { columns, rowCount, colStats } = meta;
 
     // Sample only when the file is large; otherwise scan everything. The
-    // percentage targets ~sampleTargetRows rows (memo: 1M/361M ≈ 0.28%).
+    // LIMIT caps the scan to ~sampleTargetRows rows (memo: ~1M for the 361M
+    // file) via parquet LIMIT pushdown — bounded I/O, never a full scan.
     const sampled = rowCount > sampleTargetRows;
-    const samplePct = sampled
-      ? Number(((sampleTargetRows / rowCount) * 100).toFixed(4))
-      : null;
+    const sampleLimit = sampled ? Math.min(sampleTargetRows, rowCount) : null;
     const t0 = Date.now();
-    const distinct = await sampleDistinct(abs, columns, samplePct);
+    const distinct = await sampleDistinct(abs, columns, sampleLimit);
     if (sampled && distinct.sampleN === 0) {
       console.warn(
-        `[profile] ${name}: Bernoulli sample produced 0 rows (pct=${samplePct}) — check EXPLAIN; the sample must survive the optimizer`,
+        `[profile] ${name}: LIMIT slice produced 0 rows — check the query; the slice must not be empty`,
       );
     }
     console.log(
-      `[profile] ${name} rows=${rowCount} sampled=${sampled} pct=${samplePct} sampleN=${distinct.sampleN} elapsed=${Date.now() - t0}ms`,
+      `[profile] ${name} rows=${rowCount} sampled=${sampled} limit=${sampleLimit} sampleN=${distinct.sampleN} elapsed=${Date.now() - t0}ms`,
     );
 
     const profileColumns = columns.map((c) => {
