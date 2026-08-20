@@ -247,4 +247,70 @@ describe("createParquetStore", () => {
     const badStore = createParquetStore("/path/does/not/exist/12345");
     await expect(badStore.listFiles()).rejects.toThrow(ParquetPeekError);
   });
+
+  it("getProfile enriches columns with roles, meanings, medians and category top-N", async () => {
+    const prof = await storeA.getProfile("fixture.parquet");
+    expect(prof.sizeBytes).toBeGreaterThan(0);
+
+    const priceCol = prof.columns.find((c) => c.name === "price");
+    expect(priceCol.role).toBe("price");
+    expect(priceCol.meaning).toContain("Price per share");
+    expect(typeof priceCol.median).toBe("number");
+    expect(priceCol.median).toBeGreaterThan(0);
+
+    const tsCol = prof.columns.find((c) => c.name === "ts_event");
+    expect(tsCol.role).toBe("timestamp");
+    // Logical (read-time) type, not the parquet physical storage type.
+    expect(tsCol.type).toMatch(/TIMESTAMP/i);
+
+    const rtypeCol = prof.columns.find((c) => c.name === "rtype");
+    expect(rtypeCol.role).toBe("category");
+    expect(rtypeCol.top).toHaveLength(3);
+    for (const t of rtypeCol.top) {
+      expect(t.count).toBeGreaterThan(0);
+      expect(t.pct).toBeGreaterThan(0);
+    }
+    // Exhaustive 3-value column → top-N percentages sum to ~100.
+    const total = rtypeCol.top.reduce((s, t) => s + t.pct, 0);
+    expect(total).toBeGreaterThan(99);
+    expect(total).toBeLessThan(101);
+
+    const symbolCol = prof.columns.find((c) => c.name === "symbol");
+    expect(symbolCol.role).toBe("symbol");
+  });
+
+  it("getHighlights returns TL;DR bullets and notebook questions (cached)", async () => {
+    const hl = await storeA.getHighlights("fixture.parquet");
+    expect(hl.file).toBe("fixture.parquet");
+    expect(hl.rowCount).toBe(1000);
+    expect(hl.sampled).toBe(false);
+    expect(hl.sampleN).toBe(1000);
+    expect(hl.bullets.length).toBeGreaterThan(0);
+    expect(hl.questions.length).toBeGreaterThan(0);
+    // ts_event is 13:30 UTC → peak-hour question mentions 13:00.
+    expect(hl.questions.some((q) => q.includes("13:00 UTC"))).toBe(true);
+
+    const hlCached = await storeA.getHighlights("fixture.parquet");
+    expect(hlCached).toBe(hl);
+  });
+
+  it("getHighlights on a large file is sampled and covers symbols", async () => {
+    const hl = await storeB.getHighlights("big-fixture.parquet");
+    expect(hl.sampled).toBe(true);
+    expect(hl.sampleN).toBe(500);
+    const joined = hl.bullets.join("\n");
+    expect(joined).toContain("symbols; most active");
+    expect(joined).toContain("Busiest hours");
+    expect(hl.questions.length).toBeGreaterThan(0);
+  });
+
+  it("getHighlights handles an empty file and missing files", async () => {
+    const hl = await storeA.getHighlights("empty.parquet");
+    expect(hl.bullets[0]).toBe("File has 0 rows.");
+    expect(hl.questions.length).toBe(1);
+
+    await expect(storeA.getHighlights("nonexistent.parquet")).rejects.toThrow(
+      ParquetPeekError,
+    );
+  });
 });

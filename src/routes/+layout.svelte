@@ -4,7 +4,10 @@
 
 <svelte:head>
 	<title>parquet-peek</title>
-	<meta name="description" content="Peek before deep dive — row counts, schema, profiles and previews for parquet files." />
+	<meta
+		name="description"
+		content="Understand market-data parquet files on your phone — what the columns mean, what's interesting, and what to dig into next."
+	/>
 </svelte:head>
 
 <div class="app">

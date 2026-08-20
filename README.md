@@ -1,6 +1,13 @@
 # parquet-peek
 
-A parquet-peek project generated with genproj
+A pocket interpreter for market-data parquet files (Databento-style exports), built for skimming on your phone before a real analysis on your desktop.
+
+- **File list** — instant footer-only manifest, plus a plain-English decode of each filename (`xnas-itch-20230914.mbo.parquet` → NASDAQ · ITCH · 2023-09-14 · Market-by-Order).
+- **File page** — a "what is this file?" card, a **TL;DR** of what's interesting (top symbols, typical price, busiest hours, side/action mix) from bounded sampled aggregates, and **questions worth taking to a notebook**.
+- **Schema with meanings** — column roles and plain-English explanations for the standard Databento columns; unknown columns fall back to name/type heuristics.
+- **Smarter profile** — categorical columns show top values with %, id columns show cardinality, price columns get a median.
+
+Everything stays read-only, tailnet-only, and compute-bounded: footer metadata for instant views, LIMIT-pushdown sampling + mtime caching for the aggregates.
 
 ## Capabilities
 

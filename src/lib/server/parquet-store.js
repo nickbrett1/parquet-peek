@@ -13,6 +13,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
+import {
+  decodeFilename,
+  describeColumn,
+  isNumericType,
+  isVarcharType,
+} from "../dictionary.js";
+import { buildHighlights } from "../highlights.js";
 
 const require = createRequire(import.meta.url);
 // Path to the duckdb package so the worker thread can require() it without
@@ -50,15 +57,44 @@ db.exec("PRAGMA memory_limit='1GB'", () => {
           memoryLimit: rows[0].ml,
           tempDirectory: rows[0].td,
         });
+        // Serialize every query through one promise chain: the duckdb node
+        // binding is not safe for two in-flight calls on the same Database
+        // (concurrent profile+preview+highlights requests used to overlap
+        // and crash the worker with a native Napi::Error). Queries are
+        // cheap to queue — the worker is single-threaded anyway.
+        let queue = Promise.resolve();
         parentPort.on("message", (msg) => {
-          const finish = (e, result) =>
-            parentPort.postMessage(
-              e
-                ? { id: msg.id, ok: false, error: e.message }
-                : { id: msg.id, ok: true, rows: result },
+          if (msg.shutdown) {
+            // Graceful teardown: drain the queue, then close duckdb cleanly
+            // (db.close avoids the native Napi::Error that worker.terminate()
+            // throws when a callback is still pending). The main thread
+            // terminates the (now idle) worker after this message.
+            queue = queue.then(
+              () =>
+                new Promise((resolve) => {
+                  db.close(() => {
+                    parentPort.postMessage({ type: "closed" });
+                    resolve();
+                  });
+                }),
             );
-          if (msg.exec) db.exec(msg.sql, (e) => finish(e, null));
-          else db.all(msg.sql, (e, r) => finish(e, r));
+            return;
+          }
+          queue = queue.then(
+            () =>
+              new Promise((resolve) => {
+                const finish = (e, result) => {
+                  parentPort.postMessage(
+                    e
+                      ? { id: msg.id, ok: false, error: e.message }
+                      : { id: msg.id, ok: true, rows: result },
+                  );
+                  resolve();
+                };
+                if (msg.exec) db.exec(msg.sql, (e) => finish(e, null));
+                else db.all(msg.sql, (e, r) => finish(e, r));
+              }),
+          );
         });
       },
     );
@@ -253,7 +289,34 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
     const w = worker;
     worker = null;
     workerReady = null;
-    if (w) w.terminate().catch(() => {});
+    if (!w) return;
+    // Ask the worker to close duckdb cleanly first; only force-terminate if
+    // it doesn't respond (native Napi::Error risk when killing mid-callback).
+    let terminated = false;
+    const force = setTimeout(() => {
+      if (!terminated) {
+        terminated = true;
+        w.terminate().catch(() => {});
+      }
+    }, 5000);
+    w.once("message", (msg) => {
+      if (msg.type === "closed") {
+        if (!terminated) {
+          terminated = true;
+          clearTimeout(force);
+          w.terminate().catch(() => {});
+        }
+      }
+    });
+    try {
+      w.postMessage({ shutdown: true });
+    } catch {
+      if (!terminated) {
+        terminated = true;
+        clearTimeout(force);
+        w.terminate().catch(() => {});
+      }
+    }
   }
 
   /** DuckDB memory settings as applied inside the worker. */
@@ -265,6 +328,7 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
   let listingCache = { signature: null, data: null };
   const profileCache = new Map();
   const previewCache = new Map();
+  const highlightsCache = new Map();
 
   function parquetFileNames() {
     let names;
@@ -366,6 +430,7 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
       numRowGroups,
       numColumns: columns.length,
       columns,
+      tsColumnName: tsColumn?.name ?? null,
       minTs,
       maxTs,
       colStats,
@@ -403,7 +468,8 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
   }
 
   /**
-   * Approximate distinct counts per column over a LIMIT-bounded slice.
+   * Approximate distinct counts per column over a LIMIT-bounded slice,
+   * optionally plus the median (approx_quantile) of selected columns.
    *
    * The subquery form pushes the LIMIT into the parquet scan, so only the
    * first ~sampleLimit rows are read (~1 row group ≈ 16 MB for the big file)
@@ -412,27 +478,84 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
    * even though Bernoulli sampling itself is memory-flat. The result is one
    * aggregated row (count + one HLL per column) — never table rows.
    */
-  async function sampleDistinct(abs, columns, sampleLimit) {
-    const exprs = columns
-      .map(
-        (c) =>
-          `approx_count_distinct(${sqlIdent(c.name)}) AS ${sqlIdent("__d_" + c.name)}`,
-      )
-      .join(", ");
+  async function sampleDistinct(abs, columns, sampleLimit, medianCols = []) {
+    const exprs = columns.map(
+      (c) =>
+        `approx_count_distinct(${sqlIdent(c.name)}) AS ${sqlIdent("__d_" + c.name)}`,
+    );
+    for (const name of medianCols) {
+      exprs.push(
+        `approx_quantile(${sqlIdent(name)}, 0.5) AS ${sqlIdent("__m_" + name)}`,
+      );
+    }
     const sql =
       sampleLimit !== null
-        ? `SELECT count(*) AS __n, ${exprs} FROM (
+        ? `SELECT count(*) AS __n, ${exprs.join(", ")} FROM (
              SELECT * FROM read_parquet(${sqlString(abs)}) LIMIT ${sampleLimit}
            )`
-        : `SELECT count(*) AS __n, ${exprs} FROM read_parquet(${sqlString(abs)})`;
+        : `SELECT count(*) AS __n, ${exprs.join(", ")} FROM read_parquet(${sqlString(abs)})`;
     const rows = await query(sql);
     const row = rows[0] || {};
-    const out = { sampleN: Number(row.__n) || 0 };
+    const out = { sampleN: Number(row.__n) || 0, medians: {} };
     for (const c of columns) {
       const v = row[`__d_${c.name}`];
       out[c.name] = typeof v === "bigint" ? Number(v) : (v ?? 0);
     }
+    for (const name of medianCols) {
+      const v = row[`__m_${name}`];
+      out.medians[name] =
+        v === null || v === undefined
+          ? null
+          : typeof v === "bigint"
+            ? Number(v)
+            : v;
+    }
     return out;
+  }
+
+  /** Top-N values of a column over the same LIMIT-bounded slice. */
+  async function sampleTopN(abs, col, sampleLimit, limit = 5) {
+    const src =
+      sampleLimit !== null
+        ? `(SELECT * FROM read_parquet(${sqlString(abs)}) LIMIT ${sampleLimit})`
+        : `read_parquet(${sqlString(abs)})`;
+    const rows = await query(
+      `SELECT ${sqlIdent(col)} AS __v, count(*) AS __c FROM ${src}
+			 GROUP BY ${sqlIdent(col)} ORDER BY __c DESC LIMIT ${limit}`,
+    );
+    return rows.map((r) => ({
+      value: normalizeValue(r.__v),
+      count: Number(r.__c),
+    }));
+  }
+
+  /**
+   * DuckDB logical types per column (e.g. TIMESTAMP, VARCHAR, DOUBLE) read at
+   * query time. parquet_schema reports physical storage types (INT64,
+   * BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY) which are misleading for deciding what
+   * we can safely aggregate, so we ask DuckDB directly. Returns null for an
+   * empty file (0 rows → typeof returns nothing); callers fall back.
+   */
+  async function logicalTypes(abs, slice, columns) {
+    const exprs = columns
+      .map((c) => `typeof(${sqlIdent(c.name)}) AS ${sqlIdent("__t_" + c.name)}`)
+      .join(", ");
+    const rows = await query(`SELECT ${exprs} FROM ${slice} LIMIT 1`);
+    const row = rows[0];
+    if (!row) return null;
+    const map = new Map();
+    for (const c of columns) {
+      const v = row[`__t_${c.name}`];
+      map.set(c.name, typeof v === "string" ? v : String(v ?? ""));
+    }
+    return map;
+  }
+
+  /** Bounded read slice used by profile/highlights; LIMIT pushdown caps I/O. */
+  function sliceOf(abs, sampleLimit) {
+    return sampleLimit !== null
+      ? `(SELECT * FROM read_parquet(${sqlString(abs)}) LIMIT ${sampleLimit})`
+      : `read_parquet(${sqlString(abs)})`;
   }
 
   /** GET /api/profile?file=<name> — footer stats + sampled distinct, cached per file+mtime. */
@@ -454,21 +577,62 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
     const sampled = rowCount > sampleTargetRows;
     const sampleLimit = sampled ? Math.min(sampleTargetRows, rowCount) : null;
     const t0 = Date.now();
-    const distinct = await sampleDistinct(abs, columns, sampleLimit);
+
+    // Role + meaning per column (glossary → heuristics), and which columns
+    // deserve extra stats: medians for price-like columns, top-N for
+    // categorical ones (known categories, or low-cardinality strings).
+    // Logical types come from a typeof() query, not parquet_schema (which
+    // reports physical storage types like INT64/BYTE_ARRAY).
+    const roles = new Map(
+      columns.map((c) => [c.name, describeColumn(c.name, c.type)]),
+    );
+    const slice = sliceOf(abs, sampleLimit);
+    const types =
+      (await logicalTypes(abs, slice, columns)) ??
+      new Map(columns.map((c) => [c.name, c.type]));
+    const medianCols = columns
+      .filter(
+        (c) =>
+          roles.get(c.name).role === "price" &&
+          isNumericType(types.get(c.name)),
+      )
+      .map((c) => c.name);
+    const distinct = await sampleDistinct(
+      abs,
+      columns,
+      sampleLimit,
+      medianCols,
+    );
     if (sampled && distinct.sampleN === 0) {
       console.warn(
         `[profile] ${name}: LIMIT slice produced 0 rows — check the query; the slice must not be empty`,
       );
     }
+    const categoryCols = columns
+      .filter(
+        (c) =>
+          roles.get(c.name).role === "category" ||
+          (isVarcharType(types.get(c.name)) &&
+            Number(distinct[c.name] ?? 0) <= 100),
+      )
+      .slice(0, 5);
+    const topN = {};
+    for (const c of categoryCols) {
+      topN[c.name] = await sampleTopN(abs, c.name, sampleLimit, 5);
+    }
     console.log(
-      `[profile] ${name} rows=${rowCount} sampled=${sampled} limit=${sampleLimit} sampleN=${distinct.sampleN} elapsed=${Date.now() - t0}ms`,
+      `[profile] ${name} rows=${rowCount} sampled=${sampled} limit=${sampleLimit} sampleN=${distinct.sampleN} topN=${categoryCols.length} elapsed=${Date.now() - t0}ms`,
     );
 
     const profileColumns = columns.map((c) => {
       const st = colStats.get(c.name) || { nullCount: 0, min: null, max: null };
-      return {
+      const role = roles.get(c.name);
+      const col = {
         name: c.name,
-        type: c.type,
+        type: types.get(c.name) || c.type,
+        role: role.role,
+        meaning: role.meaning,
+        unit: role.unit,
         nullCount: st.nullCount,
         nullPct: rowCount > 0 ? round2((st.nullCount / rowCount) * 100) : 0,
         min: st.min,
@@ -476,16 +640,181 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
         distinctApprox: distinct[c.name],
         sampleN: distinct.sampleN,
       };
+      if (medianCols.includes(c.name)) {
+        col.median = distinct.medians[c.name] ?? null;
+      }
+      if (topN[c.name]) {
+        col.top = topN[c.name].map((t) => ({
+          ...t,
+          pct:
+            distinct.sampleN > 0
+              ? round2((t.count / distinct.sampleN) * 100)
+              : 0,
+        }));
+      }
+      return col;
     });
 
     const data = {
       file: name,
       rowCount,
+      sizeBytes: stat.size,
       columns: profileColumns,
       sampled,
       generatedAt: new Date().toISOString(),
     };
     profileCache.set(abs, { mtimeMs: stat.mtimeMs, data });
+    return data;
+  }
+
+  /**
+   * GET /api/highlights?file=<name> — plain-language TL;DR + notebook
+   * questions, from bounded sampled aggregates (cached per file+mtime).
+   *
+   * Runs a handful of LIMIT-pushdown queries over the same slice the profile
+   * uses: scalars (count, symbol cardinality, price quantiles, size sum),
+   * top symbols, busiest hours, and top-N for categorical columns. The
+   * sentence-building itself lives in src/lib/highlights.js (pure).
+   */
+  async function getHighlights(name) {
+    assertSafeFileName(name);
+    const abs = path.join(dir, name);
+    const stat = statOf(abs, name);
+    const cached = highlightsCache.get(abs);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      return cached.data;
+    }
+
+    const meta = await fetchFileMeta(name, stat);
+    const { columns, rowCount, colStats } = meta;
+
+    const sampled = rowCount > sampleTargetRows;
+    const sampleLimit = sampled ? Math.min(sampleTargetRows, rowCount) : null;
+    const slice = sliceOf(abs, sampleLimit);
+
+    const roles = new Map(
+      columns.map((c) => [c.name, describeColumn(c.name, c.type)]),
+    );
+    const types =
+      (await logicalTypes(abs, slice, columns)) ??
+      new Map(columns.map((c) => [c.name, c.type]));
+    const symCol =
+      columns.find((c) => roles.get(c.name).role === "symbol")?.name ?? null;
+    const pxCol =
+      columns.find(
+        (c) =>
+          roles.get(c.name).role === "price" &&
+          isNumericType(types.get(c.name)),
+      )?.name ?? null;
+    const sizeCol =
+      columns.find(
+        (c) =>
+          roles.get(c.name).role === "size" && isNumericType(types.get(c.name)),
+      )?.name ?? null;
+    const tsCol =
+      meta.tsColumnName ??
+      columns.find((c) => roles.get(c.name).role === "timestamp")?.name ??
+      null;
+
+    // Scalar aggregates over the slice (one row, never table rows).
+    const sel = ["count(*) AS __n"];
+    if (symCol)
+      sel.push(`approx_count_distinct(${sqlIdent(symCol)}) AS __n_sym`);
+    if (pxCol) {
+      sel.push(
+        `approx_quantile(${sqlIdent(pxCol)}, 0.05) AS __px05`,
+        `approx_quantile(${sqlIdent(pxCol)}, 0.5) AS __px50`,
+        `approx_quantile(${sqlIdent(pxCol)}, 0.95) AS __px95`,
+      );
+    }
+    if (sizeCol) sel.push(`sum(${sqlIdent(sizeCol)}) AS __sum_size`);
+    const scalarRows = await query(`SELECT ${sel.join(", ")} FROM ${slice}`);
+    const s = scalarRows[0] || {};
+    const n = Number(s.__n) || 0;
+    const num = (v) => (v === null || v === undefined ? 0 : Number(v));
+
+    // Top symbols.
+    let topSymbols = [];
+    if (symCol && n > 0) {
+      const r = await query(
+        `SELECT ${sqlIdent(symCol)} AS __v, count(*) AS __c FROM ${slice}
+				 GROUP BY ${sqlIdent(symCol)} ORDER BY __c DESC LIMIT 5`,
+      );
+      topSymbols = r.map((x) => ({
+        value: normalizeValue(x.__v),
+        count: Number(x.__c),
+      }));
+    }
+
+    // Busiest hours (UTC) — only when the column is a genuine timestamp type
+    // at read time (parquet_schema would report INT64/BYTE_ARRAY here).
+    let hours = [];
+    if (tsCol && /TIMESTAMP|DATETIME|DATE/i.test(types.get(tsCol) ?? "")) {
+      const r = await query(
+        `SELECT CAST(datepart('hour', ${sqlIdent(tsCol)}) AS INTEGER) AS __h, count(*) AS __c
+				 FROM ${slice} GROUP BY 1 ORDER BY __c DESC LIMIT 3`,
+      );
+      hours = r.map((x) => ({ hour: Number(x.__h), count: Number(x.__c) }));
+    }
+
+    // Categorical mixes (side, action, rtype, …) — max 3 columns.
+    const catCols = columns
+      .filter((c) => roles.get(c.name).role === "category")
+      .slice(0, 3);
+    const categoryTops = [];
+    for (const c of catCols) {
+      if (n === 0) break;
+      const r = await query(
+        `SELECT ${sqlIdent(c.name)} AS __v, count(*) AS __c FROM ${slice}
+				 GROUP BY ${sqlIdent(c.name)} ORDER BY __c DESC LIMIT 5`,
+      );
+      categoryTops.push({
+        column: c.name,
+        values: r.map((x) => ({
+          value: normalizeValue(x.__v),
+          count: Number(x.__c),
+        })),
+      });
+    }
+
+    const pxStats = pxCol
+      ? {
+          min: colStats.get(pxCol)?.min ?? null,
+          max: colStats.get(pxCol)?.max ?? null,
+          p05: s.__px05 ?? null,
+          p50: s.__px50 ?? null,
+          p95: s.__px95 ?? null,
+        }
+      : null;
+
+    const { bullets, questions } = buildHighlights({
+      decoded: decodeFilename(name),
+      rowCount,
+      sampled,
+      sampleN: n,
+      minTs: meta.minTs,
+      maxTs: meta.maxTs,
+      symCol,
+      nSymbols: symCol ? num(s.__n_sym) : null,
+      topSymbols,
+      pxCol,
+      pxStats,
+      sizeCol,
+      sumSize: sizeCol ? num(s.__sum_size) : null,
+      hours,
+      categoryTops,
+    });
+
+    const data = {
+      file: name,
+      rowCount,
+      sampled,
+      sampleN: n,
+      bullets,
+      questions,
+      generatedAt: new Date().toISOString(),
+    };
+    highlightsCache.set(abs, { mtimeMs: stat.mtimeMs, data });
     return data;
   }
 
@@ -525,7 +854,14 @@ export function createParquetStore(dir = PARQUET_DIR, options = {}) {
     return data;
   }
 
-  return { listFiles, getProfile, getPreview, close, getSettings };
+  return {
+    listFiles,
+    getProfile,
+    getPreview,
+    getHighlights,
+    close,
+    getSettings,
+  };
 }
 
 /** Shared singleton used by the API routes (tests build their own). */

@@ -1,8 +1,9 @@
 <script>
 	import { formatBytes, formatCount, formatStat } from '$lib/format';
+	import { decodeFilename } from '$lib/dictionary';
 
 	let { data } = $props();
-	const files = $derived(data.files ?? []);
+	const files = $derived((data.files ?? []).map((f) => ({ ...f, decoded: decodeFilename(f.name) })));
 </script>
 
 <svelte:head>
@@ -30,6 +31,9 @@
 						<span class="dot" aria-hidden="true"></span>
 						<span class="stat"><strong>{f.numRowGroups}</strong> groups</span>
 					</div>
+					{#if f.decoded.matched}
+						<p class="card-decode">{f.decoded.summary}</p>
+					{/if}
 					{#if f.minTs !== null && f.maxTs !== null}
 						<div class="card-ts">
 							<span class="ts">{formatStat(f.minTs)}</span>
@@ -148,6 +152,13 @@
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 		font-size: 11px;
 		color: #64748b;
+	}
+
+	.card-decode {
+		margin: 8px 0 0;
+		font-size: 12px;
+		line-height: 1.45;
+		color: #94a3b8;
 	}
 
 	.arrow {

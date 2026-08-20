@@ -30,3 +30,30 @@ export function formatStat(value) {
   const s = String(value);
   return s.length > 24 ? `${s.slice(0, 21)}…` : s;
 }
+
+/** 361000000 → "361M" — compact notation for phone skimming. */
+export function formatCompact(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  return new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
+/** 0.5234 → "52.3%" (whole numbers drop the decimal). */
+export function formatPct(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  const rounded = Math.round(value * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}%`;
+}
+
+/** Price display: numbers get up to 4 decimals, strings pass through raw. */
+export function formatPrice(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Intl.NumberFormat("en-US", {
+      maximumFractionDigits: 4,
+    }).format(value);
+  }
+  return formatStat(value);
+}
