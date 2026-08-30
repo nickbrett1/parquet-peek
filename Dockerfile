@@ -13,6 +13,8 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 RUN npm run build
 
 FROM node:22-slim
+# Link the GHCR container package to its GitHub repo (public repo -> public package).
+LABEL org.opencontainers.image.source=https://github.com/nickbrett1/parquet-peek
 WORKDIR /app
 
 ENV NODE_ENV=production
