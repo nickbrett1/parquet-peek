@@ -38,7 +38,7 @@
     "globals": "^17.0.0",
     "lint-staged": "^16.4.0",
     "prettier": "^3.9.6",
-    "simple-git-hooks": "^2.13.1",
+    "simple-git-hooks": "^2.14.0",
     "svelte": "^5.56.10",
     "svelte-check": "^4.1.1",
     "typescript": "^5.7.2",
